@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sklearn.ensemble import IsolationForest
 import httpx
 
-# ---------- 配置 ----------
+# 配置
 SERVICE_HOST = "0.0.0.0"
 SERVICE_PORT = 8001
 DOWNSTREAM_URL = "http://10.40.156.213:8000/api/alert/from-detection"   # 3.3 模块地址
@@ -26,7 +26,6 @@ COOLDOWN_RED_SECONDS = 10               # 红色预警冷却时间（10分钟）
 COOLDOWN_YELLOW_SECONDS = 30           # 黄色预警冷却时间（30分钟）
 MODEL_RETRAIN_HOURS = 24                 # 每24小时重新训练模型
 
-# ---------- Pydantic 模型（与 3.1 模块对齐）----------
 class SensorDataItem(BaseModel):
     sensor_id: str
     node_id: str
@@ -42,7 +41,6 @@ class Module31Request(BaseModel):
     source: str
     data: List[SensorDataItem]
 
-# ---------- 下游报警模型（与 3.3 模块对齐）----------
 class AlertItem(BaseModel):
     alert_id: str
     alert_level: str          # "RED" / "YELLOW"
@@ -62,33 +60,27 @@ class DownstreamRequest(BaseModel):
     timestamp: str
     alerts: List[AlertItem]
 
-# ---------- 传感器上下文 ----------
 class SensorContext:
     """每个传感器的运行时状态"""
     def __init__(self, sensor_id: str, sensor_type: str, function: str):
         self.sensor_id = sensor_id
-        self.sensor_type = sensor_type   # "INT" 或 "FLOAT"
-        self.function = function         # "motion" 或 "current"
-        self.history: Deque[tuple] = deque()   # 元素为 (timestamp, value)
+        self.sensor_type = sensor_type  
+        self.function = function        
+        self.history: Deque[tuple] = deque()   
         self.last_red_alert_time: float = 0
         self.last_yellow_alert_time: float = 0
         self.model: Optional[IsolationForest] = None
         self.last_train_time: float = 0
-        self.feature_cache: Deque[Dict] = deque(maxlen=MAX_HISTORY_DAYS * 24)  # 每小时一个特征点
+        self.feature_cache: Deque[Dict] = deque(maxlen=MAX_HISTORY_DAYS * 24)  
 
     def add_data_point(self, ts: datetime, value: float):
         """添加原始数据点，保留 MAX_HISTORY_DAYS 天"""
         self.history.append((ts, value))
-        # 清理过期数据（保留最近 MAX_HISTORY_DAYS 天）
         cutoff = datetime.now() - timedelta(days=MAX_HISTORY_DAYS)
         while self.history and self.history[0][0] < cutoff:
             self.history.popleft()
 
     def extract_features(self, ts: datetime) -> Optional[Dict]:
-        """
-        提取当前时间窗口（过去 FEATURE_WINDOW_MINUTES 分钟）的特征。
-        返回特征字典，若数据不足则返回 None。
-        """
         window_start = ts - timedelta(minutes=FEATURE_WINDOW_MINUTES)
         window_data = [(t, v) for t, v in self.history if window_start <= t <= ts]
         if not window_data:
@@ -96,7 +88,6 @@ class SensorContext:
 
         values = [v for _, v in window_data]
         if self.sensor_type == "INT" and self.function == "motion":
-            # 运动传感器：统计开关次数、开启次数占比等
             motion_count = sum(1 for v in values if v == 1)
             total_events = len(values)
             feature = {
@@ -107,7 +98,6 @@ class SensorContext:
                 "value_std": np.std(values) if len(values) > 1 else 0,
             }
         else:
-            # 连续值传感器（用水、电流）：统计均值、总和、方差等
             feature = {
                 "hour": ts.hour,
                 "total_events": len(values),
@@ -118,11 +108,9 @@ class SensorContext:
         return feature
 
     def train_model(self):
-        """使用历史特征训练 IsolationForest 模型"""
-        if len(self.feature_cache) < 24:   # 至少需要一天的数据才能训练
+        if len(self.feature_cache) < 24: 
             return
         df = pd.DataFrame(self.feature_cache)
-        # 选择数值列作为训练特征（排除 hour）
         feature_cols = [c for c in df.columns if c != "hour"]
         X = df[feature_cols].values
         if X.shape[0] < 10:
@@ -136,10 +124,6 @@ class SensorContext:
         self.last_train_time = time.time()
 
     def predict_anomaly(self, feature: Dict) -> tuple[bool, float]:
-        """
-        使用 IsolationForest 预测当前特征是否异常。
-        返回 (是否异常, 置信度) ，置信度 = 1 - 异常分数（归一化到0~1）
-        """
         if self.model is None:
             return False, 0.0
         # 构造特征向量（顺序与训练时一致）
@@ -158,17 +142,13 @@ class SensorContext:
         else:
             return False, 1.0 - confidence
 
-# ---------- 全局存储 ----------
 sensors: Dict[str, SensorContext] = {}
-# 线程锁（asyncio 中使用 asyncio.Lock）
 sensor_lock = asyncio.Lock()
 
-# ---------- 辅助函数 ----------
 def generate_alert_id() -> str:
     return f"alert_{int(time.time() * 1000)}_{np.random.randint(1000, 9999)}"
 
 async def send_alert_to_downstream(alert: AlertItem):
-    """发送预警到 3.3 模块（非阻塞）"""
     async with httpx.AsyncClient(timeout=5.0) as client:
         payload = DownstreamRequest(
             status=0,
@@ -186,12 +166,9 @@ async def send_alert_to_downstream(alert: AlertItem):
             print(f"[发送异常] {alert.alert_id} : {str(e)}")
 
 async def rule_based_detection(ctx: SensorContext, now: datetime) -> Optional[AlertItem]:
-    """规则引擎：连续 RED_NO_ACTIVITY_HOURS 小时无活动 -> 红色预警"""
-    # 检查历史数据中最近 RED_NO_ACTIVITY_HOURS 小时内是否有数据
     cutoff = now - timedelta(hours=RED_NO_ACTIVITY_HOURS)
     recent_data = [(t, v) for t, v in ctx.history if t >= cutoff]
     if not recent_data:
-        # 没有任何数据点，视为无活动
         description = f"传感器 {ctx.sensor_id} 已连续 {RED_NO_ACTIVITY_HOURS} 小时无任何数据上报，可能老人长时间无活动。"
         return AlertItem(
             alert_id=generate_alert_id(),
@@ -228,14 +205,12 @@ async def rule_based_detection(ctx: SensorContext, now: datetime) -> Optional[Al
 
 async def ml_based_detection(ctx: SensorContext, now: datetime) -> Optional[AlertItem]:
     """机器学习基线偏离检测：返回黄色预警（若异常）"""
-    # 提取当前小时的特征
     feature = ctx.extract_features(now)
     if feature is None:
         return None
     # 将特征加入缓存（用于后续训练）
     ctx.feature_cache.append(feature)
 
-    # 定期重新训练模型
     if time.time() - ctx.last_train_time > MODEL_RETRAIN_HOURS * 3600:
         ctx.train_model()
 
@@ -288,14 +263,12 @@ async def process_sensor_data(sensor_id: str, ts: datetime, value: float, data_t
             ctx.last_yellow_alert_time = time.time()
             await send_alert_to_downstream(yellow_alert)
 
-# ---------- FastAPI 应用 ----------
+# FastAPI 应用 
 app = FastAPI(title="时序守望 - 渐进式时序异常检测中枢")
 
 @app.post("/api/v1/3_2/sensor_data")
 async def receive_sensor_data(request: Module31Request, background_tasks: BackgroundTasks):
-    """
-    接收 3.1 模块推送的传感器数据，进行异常检测，并将预警异步发送至 3.3 模块。
-    """
+    # 接收 3.1 模块推送的传感器数据，进行异常检测，并将预警异步发送至 3.3 模块。
     for item in request.data:
         try:
             ts = datetime.fromisoformat(item.timestamp.replace('Z', '+00:00'))
@@ -315,7 +288,7 @@ async def receive_sensor_data(request: Module31Request, background_tasks: Backgr
 async def health_check():
     return {"status": "alive", "sensors_count": len(sensors)}
 
-# ---------- 启动服务 ----------
+# 启动服务
 if __name__ == "__main__":
     import uvicorn
     print("[3.2 算法引擎] 启动中...")
